@@ -38,9 +38,6 @@ Remove the upgradeSpecificContract, batchUpgradeContracts, and associated helper
 **Severity: Critical** 
 **Location: MiniSafeFactoryUpgradeable.sol**
 
- 
-Severity: Critical Location: MiniSafeFactoryUpgradeable.sol
-
 ### Description
 The `MiniSafeFactoryUpgradeable` contract allows the deployment of MiniSafe instances with a TimelockController configuration that is insecure. Specifically, the `_validateConfig` function and other deployment helper functions allow a minDelay as short as 1 minute.
 
@@ -274,7 +271,7 @@ function _validateConfig(UpgradeableConfig memory config) internal pure {
 
 2. Protocol can enforce that the proposer's address must be a single multisig address which has a minimum of 5 signers so that any call made to the timelock contract via the multisig (which is the proposer and canceller) would be signed by atleast 4 signers to initiate an upgrade or to cancel an upgrade as well.
 
-## Payout Order Corruption via Swap-and-Pop
+## 3.  Payout Order Corruption via Swap-and-Pop
 **Severity: High**
 **Location: MiniSafeAaveUpgradeable.sol -> _removeMemberFromGroup**
 
@@ -296,7 +293,7 @@ When a member leaves the group (which is allowed if they haven't received a payo
 Replace the swap-and-pop logic with an ordered removal. When a member is removed, all subsequent elements in the array should be shifted down by one index to close the gap. This preserves the relative order of the remaining members.
 
 
-## Payout Order Corruption via Array Duplication
+## 4.  Payout Order Corruption via Array Duplication
 **Severity: High** 
 **Location: MiniSafeAaveUpgradeable.sol -> _setupPayoutOrder**
 
@@ -306,11 +303,11 @@ The `MiniSafeAaveUpgradeable` contract allows group administrators to manually s
 The `_setupPayoutOrder` function iterates through all group members and appends them to the payoutOrder array using .push(). It does not check if the array is already populated, nor does it clear existing entries.
 
 Impact
-If an admin uses setPayoutOrder before the group is full, the payoutOrder array will contain the manually set entries. When the group subsequently fills up and activates, _setupPayoutOrder runs and appends all members again.
+If an admin uses setPayoutOrder before the group is full, the payoutOrder array will contain the manually set entries. When the group subsequently fills up and activates, `_setupPayoutOrder` runs and appends all members again.
 
 This results in a payoutOrder array that contains duplicate addresses and has a length greater than the number of members (e.g., 2x the size).
 
-Broken Cycle Logic: The payout rotation relies on payoutOrder.length. A corrupted length disrupts the modulo arithmetic used to determine the recipient.
+Broken Cycle Logic: The payout rotation relies on `payoutOrder.length`. A corrupted length disrupts the modulo arithmetic used to determine the recipient.
 Double Payouts / Skipped Members: Duplicate addresses in the order mean some members may be paid multiple times while others are skipped.
 State Corruption: The group state becomes inconsistent with the actual membership, potentially leading to stuck funds or reverts during distributePayout.
 
@@ -338,39 +335,42 @@ function _setupPayoutOrder(uint256 groupId) internal {
 
 
 ```
-Emergency Withdrawal Causes Zombie State and Traps Funds
-Severity: High Location: MiniSafeAaveUpgradeable.sol > emergencyWithdraw
+## 5. Emergency Withdrawal Causes Zombie State and Traps Funds
+**Severity: High** 
+**Location: MiniSafeAaveUpgradeable.sol -> emergencyWithdraw**
 
-Description
-The emergencyWithdraw function allows a group admin to withdraw their current cycle's contribution and immediately deactivate the group (group.isActive = false). However, the function fails to remove the admin from the members array or the payoutOrder. It only manually resets the admin's contribution balances.
+### Description
+The emergencyWithdraw function allows a group admin to withdraw their current cycle's contribution and immediately deactivate the group (`group.isActive = false`). However, the function fails to remove the admin from the members array or the payoutOrder. It only manually resets the admin's contribution balances.
 
-Impact
+### Impact
 Zombie Admin State: The admin remains listed as a member of the group despite having withdrawn their funds and "killed" the group. They continue to occupy one of the limited member slots (MAX_MEMBERS).
+
 Blocking Recovery: Because the admin slot is not freed, the group remains "full" (or partially full) with a dead member. This prevents any potential recovery mechanisms (like new members joining to restart the cycle) from functioning.
 Trapped Honest Funds: The group is unilaterally deactivated. While the admin exits cleanly with their funds, honest members are left in a deactivated group. If they attempt to leave, they must rely on the leaveGroup function, which interacts poorly with the zombie state and has its own accounting bugs (refunds totalContributed instead of contributions).
-Recommendation
+### Recommendation
 The `emergencyWithdraw` function should call the internal `_removeMemberFromGroup` function and remove the admin from the group.
 
 
-## Misleading Error Message in Withdrawal Logic
+## 6. Misleading Error Message in Withdrawal Logic
 **Severity: Low**
 **Location: MiniSafeAaveIntegrationUpgradeable.sol > withdrawFromAave**
 
-Description
+### Description
 In the withdrawFromAave function, there is a requirement check performed after the Aave withdrawal attempt:
 
-solidity
+```solidity
 require(amountWithdrawn > 0, "aToken address not found");
+```
+
 The error message "aToken address not found" is semantically incorrect for this check. The existence of the aTokenAddress is already verified at the beginning of the function. If this specific requirement fails, it means the interaction with the Aave pool resulted in 0 tokens being withdrawn, not that the address is missing.
 
-Impact
+### Impact
 This misleading error message causes significant confusion during debugging and operations. If a withdrawal fails (e.g., returns 0 due to pool logic), the error suggests a configuration issue (missing token support) rather than the actual runtime issue (failed withdrawal execution). This wastes developer time and obscures the root cause of failures.
 
 
 
 
-
-### Incorrect Refund Calculation and Mechanism in leaveGroup
+### 7. Incorrect Refund Calculation and Mechanism in leaveGroup
 ### Severity: Critical 
 ### Location: MiniSafeAaveUpgradeable.sol -> leaveGroup
 
@@ -378,32 +378,31 @@ This misleading error message causes significant confusion during debugging and 
 The `leaveGroup` function contains two critical flaws in how it handles refunds for members exiting a group:
 
 Incorrect Amount (`totalContributed`): The function calculates refundAmount using `group.totalContributed[msg.sender]`. This variable tracks the lifetime contributions of a member. If a member has participated in previous cycles, this amount includes funds that have already been paid out to other members. The contract only holds the funds for the current cycle (group.contributions).
-Incorrect Mechanism (`updateUserBalance`): The function attempts to process the refund by calling `updateUserBalance(..., false)`. 
-This function is part of the Savings module; it decreases the user's savings share record in TokenStorage. It does not transfer ERC20 tokens back to the user.
 
 ### Impact
-Insolvency / Denial of Service: Attempting to refund `totalContributed` will likely exceed the contract's current token balance (since past funds are gone). This causes the transaction to revert due to insufficient funds, effectively trapping the user in the group.
-Loss of Assets: Even if the transaction succeeds (e.g., if the contract holds excess funds from other users), the updateUserBalance call destroys the user's savings shares without sending them any tokens. The user leaves the group, loses their savings record, and receives nothing.
+Insolvency / Denial of Service: Attempting to refund `totalContributed` will likely exceed the contract's current token balance (since past funds are gone). This causes the transaction to revert due to insufficient funds or it will send out the funds from another group's contributions, effectively trapping the user in the group.
+
 
 ### Recommendation
 Change the refund source to `group.contributions[msg.sender]` to refund only the funds held for the current active cycle.
 
 
 
-Circuit Breaker Griefing (Denial of Service)
-Severity: High Location: MiniSafeAaveUpgradeable.sol > _checkCircuitBreaker
+## 8. Circuit Breaker Griefing (Denial of Service)
+**Severity: Low** 
+**Location: MiniSafeAaveUpgradeable.sol -> _checkCircuitBreaker**
 
-Description
-The _checkCircuitBreaker function is designed to pause the contract if certain thresholds are met, intended as a safety mechanism against hacks. However, the logic allows any user to trigger this global pause by performing a valid action that hits the threshold limits.
+### Description
+The `_checkCircuitBreaker` function is designed to pause the contract if certain thresholds are met, intended as a safety mechanism against hacks. However, the logic allows any user to trigger this global pause by performing a valid action that hits the threshold limits.
 
 Specifically:
 
-Amount Threshold: If a user withdraws an amount >= withdrawalAmountThreshold (default 1000 tokens), the system pauses.
-Frequency Threshold: If any two withdrawals occur within timeBetweenWithdrawalsThreshold (default 5 minutes), the system pauses.
-Because withdrawalAmountThreshold is hardcoded to 1000 ether (1000 * 10^18), for low-value tokens or tokens with 18 decimals, this threshold is easily reachable by normal users. Furthermore, the frequency check uses a global timestamp, meaning any two users transacting near each other will inadvertently pause the system.
+Amount Threshold: If a user withdraws an `amount >= withdrawalAmountThreshold` (default 1000 tokens), the system pauses.
+Frequency Threshold: If any two withdrawals occur within `timeBetweenWithdrawalsThreshold` (default 5 minutes), the system pauses.
+Because withdrawalAmountThreshold is hardcoded to `1000 ether (1000 * 10^18)`, for low-value tokens or tokens with 18 decimals, this threshold is easily reachable by normal users. Furthermore, the frequency check uses a global `timestamp,` meaning any two users transacting near each other will inadvertently pause the system.
 
-Impact
+### Impact
 Denial of Service (DoS): A malicious user (or even an honest user) can repeatedly trigger the circuit breaker, freezing the protocol for all other users. This requires the admin to manually unpause the contract each time, creating a permanent denial of service vector.
 
-Recommendation
-Change the behavior of the threshold checks from Pausing (Circuit Breaker) to Reverting (Rate Limiting).
+### Recommendation
+Change the behavior of the threshold checks from Pausing (Circuit Breaker) to Reverting (Rate Limiting). Admin can update the withdrawalthreshold for user to 

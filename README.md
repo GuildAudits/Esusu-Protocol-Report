@@ -1,3 +1,38 @@
+# Esusu Protocol Initial Report
+
+
+| ID   | Finding Title                                                          | Location / Code                                                                | Severity     |
+| ---- | ---------------------------------------------------------------------- | ------------------------------------------------------------------------------ | ------------ |
+| H-1  | Broken Factory Upgrade Mechanism                                       | `MiniSafeFactoryUpgradeable.sol`                                               | **Critical** |
+| H-2  | Malicious Upgrade via Insufficient Timelock Delay                      | `MiniSafeFactoryUpgradeable.sol`                                               | **Critical** |
+| H-3  | Payout Order Corruption via Swap-and-Pop                               | `MiniSafeAaveUpgradeable.sol → _removeMemberFromGroup`                         | **High**     |
+| H-4  | Payout Order Corruption via Array Duplication                          | `MiniSafeAaveUpgradeable.sol → _setupPayoutOrder`                              | **High**     |
+| H-5  | Emergency Withdrawal Fails to Transfer Recovered Tokens                | `MiniSafeAaveUpgradeable.sol → executeEmergencyWithdrawal`                     | **High**     |
+| H-6  | No Mechanism to Claim Aave External Reward Incentives                  | `MiniSafeAaveIntegrationUpgradeable.sol`                                       | **High**     |
+| H-7  | Depositors Receive Zero Interest                                       | `MiniSafeTokenStorageUpgradeable.sol / MiniSafeAaveIntegrationUpgradeable.sol` | **High**     |
+| H-8  | Incorrect Refund Calculation Due to totalContributed Not Reset         | `MiniSafeAaveUpgradeable.sol → _resetCycle / leaveGroup`                       | **High**     |
+| H-9  | Circuit Breaker Allows Triggering Withdrawal to Succeed (Protocol DoS) | `MiniSafeAaveUpgradeable.sol → withdraw / _checkCircuitBreaker`                | **High**     |
+| H-10 | Missing Token Consistency Check in Group Contributions                 | `MiniSafeAaveUpgradeable.sol → makeContribution`                               | **High**     |
+| H-11 | Emergency Withdrawal Locks Other Members in Inactive Group             | `MiniSafeAaveUpgradeable.sol → emergencyWithdraw`                              | **High**     |
+| H-12 | leaveGroup Always Reverts Due to Missing Balance Credit                | `MiniSafeAaveUpgradeable.sol → leaveGroup / updateUserBalance`                 | **High**     |
+| M-1  | Excess Contribution Amounts Permanently Trapped                        | `MiniSafeAaveUpgradeable.sol → makeContribution`                               | **Medium**   |
+| M-2  | Emergency Withdrawal Timelock Defeats Emergency Purpose                | `MiniSafeAaveUpgradeable.sol → executeEmergencyWithdrawal`                     | **Medium**   |
+| M-3  | Thrift Group Contributions Do Not Earn Yield                           | `MiniSafeAaveUpgradeable.sol → makeContribution`                               | **Medium**   |
+| M-4  | Factory Does Not Track Deployed Proxies                                | `MiniSafeFactoryUpgradeable.sol → isMiniSafeContract`                          | **Medium**   |
+| M-5  | cUSD Initialization Missing aToken & Share Setup                       | `MiniSafeTokenStorageUpgradeable.sol → initialize`                             | **Medium**   |
+| M-6  | nextPayoutDate Not Enforced                                            | `MiniSafeAaveUpgradeable.sol → _checkAndProcessPayout`                         | **Medium**   |
+| M-7  | Circuit Breaker Frequency Check Is Global (Soft DoS)                   | `MiniSafeAaveUpgradeable.sol → withdraw`                                       | **Medium**   |
+| M-8  | Withdrawal Window Breaks for Short Months                              | `MiniSafeAaveUpgradeable.sol → canWithdraw`                                    | **Medium**   |
+| M-9  | deployWithRecommendedMultiSig Allows Duplicate Signers                 | `MiniSafeFactoryUpgradeable.sol → deployWithRecommendedMultiSig`               | **Medium**   |
+| L-1  | Identical Events for Pool & PoolDataProvider Updates                   | `MiniSafeAaveIntegrationUpgradeable.sol`                                       | **Low**      |
+| L-2  | Deposit Timestamp Overwritten and Unused                               | `MiniSafeAaveUpgradeable.sol`                                                  | **Low**      |
+| L-3  | Misleading Error Message in withdrawFromAave                           | `MiniSafeAaveIntegrationUpgradeable.sol → withdrawFromAave`                    | **Low**      |
+| L-4  | Hardcoded Aave Provider Address                                        | `MiniSafeFactoryUpgradeable.sol → _deployAaveIntegration`                      | **Low**      |
+| L-5  | TokenStorage Pause/Unpause Has No Effect                               | `MiniSafeTokenStorageUpgradeable.sol`                                          | **Low**      |
+| L-6  | Thrift Group Cannot Be Activated After Start Date                      | `MiniSafeAaveUpgradeable.sol → activateThriftGroup`                            | **Low**      |
+
+
+
 
 ## [H-1] Broken Factory Upgrade Mechanism
 

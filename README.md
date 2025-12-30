@@ -3,8 +3,8 @@
 
 | ID   | Finding Title                                                          | Location / Code                                                                | Severity     |
 | ---- | ---------------------------------------------------------------------- | ------------------------------------------------------------------------------ | ------------ |
-| H-1  | Broken Factory Upgrade Mechanism                                       | `MiniSafeFactoryUpgradeable.sol`                                               | **Critical** |
-| H-2  | Malicious Upgrade via Insufficient Timelock Delay                      | `MiniSafeFactoryUpgradeable.sol`                                               | **Critical** |
+| H-1  | Broken Factory Upgrade Mechanism                                       | `MiniSafeFactoryUpgradeable.sol`                                               | **High** |
+| H-2  | Malicious Upgrade via Insufficient Timelock Delay                      | `MiniSafeFactoryUpgradeable.sol`                                               | **High** |
 | H-3  | Payout Order Corruption via Swap-and-Pop                               | `MiniSafeAaveUpgradeable.sol → _removeMemberFromGroup`                         | **High**     |
 | H-4  | Payout Order Corruption via Array Duplication                          | `MiniSafeAaveUpgradeable.sol → _setupPayoutOrder`                              | **High**     |
 | H-5  | Emergency Withdrawal Fails to Transfer Recovered Tokens                | `MiniSafeAaveUpgradeable.sol → executeEmergencyWithdrawal`                     | **High**     |

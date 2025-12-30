@@ -665,3 +665,886 @@ Denial of Service (DoS): A malicious user (or even an honest user) can repeatedl
 
 ### Recommendation
 Change the behavior of the threshold checks from Pausing (Circuit Breaker) to Reverting (Rate Limiting). Admin can update the withdrawalthreshold for user to 
+
+
+
+
+
+# **Title**
+
+Interest Accrual From aToken Rebasing Is Trapped in Contract and Not Attributed to Users
+
+**Severity**
+High
+
+**Description**
+The protocol tracks user balances using the number of aTokens (shares) returned at deposit time:
+
+- The `deposit()` function transfers tokens to the Aave integration contract.
+- `depositToAave()` supplies the tokens into Aave and calculates the number of aTokens received:
+
+```solidity
+sharesReceived = aTokenBalanceAfter - aTokenBalanceBefore;
+```
+
+- This `sharesReceived` value is recorded in storage as the user’s balance via `updateUserTokenShare()`.
+
+However, Aave aTokens are **rebasing tokens**, their balance automatically increases over time as yield accrues. The rebasing occurs at the **contract address** holding the aTokens, not at the user balance level.
+
+Because users’ balances are stored as a fixed `shareAmount`:
+
+```solidity
+userBalance.tokenShares[tokenAddress] += shareAmount;
+```
+
+they never increase as interest accrues. Instead:
+
+- aToken balance growth occurs on the contract
+- user share balances remain static
+- the delta (yield) is accumulated as unaccounted surplus inside the contract
+
+Thus, all earned interest remains trapped in the protocol contract instead of being reflected in user balances or made withdrawable.
+
+This breaks the expected behavior of Aave deposits, where users should benefit from proportional interest growth.
+
+**Impact**
+Users deposit funds but do **not receive any yield** from Aave interest accrual.
+
+**Recommendation**
+Refactor accounting to make user balances **represent a proportional share of the total aToken balance**, rather than a static aToken amount at deposit time.
+
+Use a **shares → proportional balance model**, where:
+
+- `totalShares` tracks the share supply
+- user balances store **shares**, not raw aTokens
+- interest is implicitly reflected by `aTokenBalance / totalShares`
+
+On withdrawal, compute:
+
+```solidity
+amountOut = (userShares * totalATokenBalance) / totalShares;
+```
+
+This ensures users automatically receive their share of accrued interest.
+
+# **Title**
+
+Circuit Breaker Allows Triggering Transaction to Succeed, Enabling Repeated Protocol-Wide DoS on Withdrawals
+
+**Severity**
+High
+
+**Description**
+The circuit breaker in the `withdraw()` function is intended to stop suspicious or large withdrawals by pausing the contract when:
+
+- `withdrawAmount >= withdrawalAmountThreshold`.
+
+The logic calls:
+
+```solidity
+_checkCircuitBreaker(amount);
+```
+
+which triggers:
+
+```solidity
+function _triggerCircuitBreaker(string memory reason) internal {
+    _pause();
+    emit CircuitBreakerTriggered(reason, block.timestamp);
+}
+```
+
+However, after `_pause()` is executed, **the transaction that triggered the circuit breaker is still allowed to continue**. The withdrawal proceeds and funds are transferred:
+
+```solidity
+updateUserBalance(...);
+aaveIntegration.withdrawFromAave(...);
+```
+
+This means:
+
+- the attacker successfully withdraws their funds
+- only after their withdrawal completes, the protocol becomes paused
+- all other users are now blocked from withdrawing
+
+An attacker can repeatedly:
+
+1. Deposit an amount ≥ `withdrawalAmountThreshold`
+2. Call `withdraw()` for the same amount
+3. Trigger circuit breaker → contract pauses
+4. Still receive their withdrawal
+5. Wait for admin to unpause
+6. Repeat the process
+
+Flash loans make this trivial and low-cost.
+
+Instead of stopping malicious withdrawals, the breaker becomes a **griefing / DoS vector** that attackers can intentionally exploit.
+
+**Impact**
+This issue enables a malicious user to:
+
+- repeatedly force the protocol into a paused state
+- prevent all other users from withdrawing during the withdrawal window
+- cause continual system-wide denial-of-service
+- extract their funds while freezing everyone else’s
+
+**Recommendation**
+Modify the circuit breaker so that:
+
+- when triggered, the **withdrawal reverts**
+- execution does not proceed past `_pause()`
+
+# **Title**
+
+Missing Token Consistency Check Allows Users to Contribute a Different Token Than the Accepted Group Token
+
+**Severity**
+High
+
+**Description**
+When a thrift group is created, the group’s contribution token is explicitly stored:
+
+```solidity
+newGroup.tokenAddress = tokenAddress;
+```
+
+This defines the **accepted token for all group contributions and payouts**.
+
+However, during contributions, the `makeContribution()` logic does **not** verify that the token supplied by the contributor matches the group’s configured token:
+
+```solidity
+function makeContribution(
+    uint256 groupId,
+    address tokenAddress,
+    uint256 amount
+) public onlyGroupMember(groupId) onlyActiveGroup(groupId) nonReentrant {
+    ThriftGroup storage group = thriftGroups[groupId];
+
+    require(tokenStorage.isValidToken(tokenAddress), "Unsupported token");
+    require(amount >= group.contributionAmount, "Contribution amount too small");
+```
+
+The only check performed is that the token is _valid in the protocol_, not that it is the **same token used by the group**.
+
+This allows a malicious user to:
+
+- create or join a thrift group that uses token A (e.g., USDC)
+- contribute using token B (e.g., a lower-value token or a rebasing token)
+- still receive credit for a valid contribution
+- still qualify for payout rotation
+
+Because contribution amounts are tracked purely numerically:
+
+```solidity
+group.contributions[msg.sender] += amount;
+group.totalContributed[msg.sender] += amount;
+```
+
+The attacker may:
+
+- contribute a token with different decimals / market value
+- manipulate payout distribution amounts
+- break accounting assumptions inside `_checkAndProcessPayout`
+- distort group balances and payout fairness
+
+If the payout is denominated in the _group token_, the attacker can intentionally deposit a cheaper or unstable asset and still receive payouts in the real group asset.
+
+This can also **brick payout processing** if the token mismatch causes transfer failures or accounting imbalance.
+
+**Impact**
+Attackers can:
+
+- contribute a cheaper / volatile token while others contribute the intended asset
+- gain disproportionately high payout relative to their effective contribution
+- cause payout amounts to miscalculate or revert
+- poison group accounting over time
+
+Potential scenarios:
+
+1. Contribute a token with fewer decimals
+   → accounting appears equal, but real value contributed is lower
+
+2. Contribute a token with different price
+   → attacker contributes low-value asset, receives payout in high-value asset
+
+3. Contribute a token incompatible with payout logic
+   → payout distribution may revert / lock group state
+
+**Recommendation**
+Enforce strict token consistency between:
+
+- the group’s configured `tokenAddress`, and
+- the token used in each contribution call
+
+Add check:
+
+```solidity
+require(
+    tokenAddress == group.tokenAddress,
+    "Invalid contribution token for this group"
+);
+```
+
+Example corrected contribution logic:
+
+```solidity
+ThriftGroup storage group = thriftGroups[groupId];
+
+require(tokenAddress == group.tokenAddress, "Invalid group token");
+require(amount >= group.contributionAmount, "Contribution amount too small");
+```
+
+# **Title**
+
+Emergency Withdrawal Allows Admin to Exit While Locking Other Members in an Inactive Thrift Group With No Recovery Path
+**Severity**
+High
+
+**Description**
+The `emergencyWithdraw` function allows only the **group admin** to withdraw their contribution and automatically deactivates the group:
+
+```solidity
+function emergencyWithdraw(uint256 groupId)
+    external
+    onlyGroupAdmin(groupId)
+    nonReentrant
+{
+    ThriftGroup storage group = thriftGroups[groupId];
+
+    uint256 amount = group.contributions[msg.sender];
+    require(amount > 0, "No contribution to withdraw");
+
+    group.contributions[msg.sender] = 0;
+    group.hasPaidThisCycle[msg.sender] = false;
+    group.totalContributed[msg.sender] -= amount;
+
+    group.isActive = false; // deactivate group on emergency withdrawal
+
+    IERC20(group.tokenAddress).safeTransfer(msg.sender, amount);
+}
+```
+
+Key issues:
+
+1. The admin’s withdrawal **forces the group into an inactive state**
+
+```solidity
+group.isActive = false;
+```
+
+2. There is **no mechanism for other members to**
+
+- exit the group
+- recover their contributions
+- trigger refunds
+- or leave after deactivation
+
+3. Members are still locked in the contract with:
+
+- `contributions[msg.sender] > 0`
+- but no active payout / contribution cycle
+- and no callable function to withdraw funds
+
+This results in an asymmetric failure mode:
+
+- Admin can exit safely at any time
+- Other contributors are left stranded with no way to recover funds
+
+If the admin withdraws early — maliciously or accidentally — all remaining users become permanently locked.
+
+**Impact**
+Funds contributed by non-admin members become **inaccessible** if:
+
+- the admin performs emergency withdrawal, and
+- the group becomes inactive
+
+**Recommendation**
+
+Implement a symmetric exit mechanism for all members when emergency mode is triggered.
+
+# **Title**
+
+**`leaveGroup()` will always revert because `updateUserBalance()` deducts from a balance that was never credited**
+
+## Severity
+
+High
+
+## Description
+
+`leaveGroup()` attempts to process a refund by deducting from the user’s recorded balance:
+
+```
+updateUserBalance(msg.sender, tokenAddress, refundAmount, false);
+```
+
+However, during normal contributions, the contract **never credits**
+`updateUserBalance()` with the contributed amount.
+
+Meaning:
+
+- user deposits tokens into the contract
+- but their **internal balance remains zero**
+- when leaving the group, `updateUserBalance()` attempts to deduct
+  `refundAmount` from a **non-existent balance**
+
+This causes the function to **always revert**.
+So one of two failure modes occurs:
+
+| Case                | Effect                                        |
+| ------------------- | --------------------------------------------- |
+| `refundAmount == 0` | user receives no refund despite contributions |
+| `refundAmount > 0`  | `updateUserBalance()` underflows or fails     |
+
+Either outcome prevents successful exit.
+
+### Result
+
+Users who contributed:
+
+- cannot leave the group
+- cannot recover funds
+- are permanently locked in the contract
+
+This is effectively a **denial-of-service on exiting members**.
+
+## Impact
+
+- Users cannot leave thrift groups
+- Their funds remain inaccessible
+- Group cannot scale down safely
+
+## Recommendations
+
+Ensure user balances are credited when contributing.
+
+# **Title**
+
+**`leaveGroup()` emits refund event but never transfers tokens — user funds remain locked in contract**
+
+## Severity
+
+High
+
+## Description
+
+When a user leaves the group, the contract emits a `RefundIssued` event, but **no refund is ever transferred** to the user.
+
+Instead of sending tokens back, the function calls:
+
+```
+updateUserBalance(msg.sender, tokenAddress, refundAmount, false);
+```
+
+This function only adjusts an **internal bookkeeping balance** and
+does **not perform any ERC20 transfer**.
+
+Therefore:
+
+> The protocol signals a refund was issued
+> but the funds remain locked inside the contract
+
+This is especially critical because `_removeMemberFromGroup()` clears
+member state **before** any refund occurs — leaving no recovery path.
+
+If the group becomes inactive due to member removal:
+
+```
+group.isActive = false;
+```
+
+remaining users:
+
+- cannot withdraw
+- cannot leave
+- cannot trigger refunds
+
+Their contributions are permanently stuck.
+
+## Impact
+
+- Users lose access to contributions when leaving group
+- Contract emits misleading `RefundIssued` event
+- No mechanism exists to recover locked funds
+- Inactive groups trap remaining capital
+
+## Recommendations
+
+Replace ledger adjustment with an actual refund transfer:
+
+```
+IERC20(tokenAddress).safeTransfer(msg.sender, refundAmount);
+```
+
+# **Title**
+
+Global Frequency-Based Circuit Breaker Causes Unintended Protocol-Wide Soft DoS
+
+**Severity**
+Medium
+
+**Description**
+The circuit breaker also pauses the protocol when two withdrawals occur too closely in time:
+
+```solidity
+if (
+    lastWithdrawalTimestamp != 0 &&
+    block.timestamp - lastWithdrawalTimestamp < timeBetweenWithdrawalsThreshold
+) {
+    _triggerCircuitBreaker("Withdrawals too frequent");
+}
+```
+
+The problem is that this logic:
+
+- tracks `lastWithdrawalTimestamp` **globally**
+- not per-user
+
+This means:
+
+- if any two users withdraw close together → the circuit breaker triggers
+- normal withdrawal activity can unintentionally pause the contract
+- legitimate behavior appears as an attack condition
+
+This creates a **soft denial-of-service condition**, where:
+
+- ordinary user activity increases risk of accidental pauses
+- withdrawal windows may frequently halt
+
+**Impact**
+Consequences include:
+
+- legitimate users can unintentionally trigger pauses
+- normal withdrawal bursts become impossible
+- operations become fragile and prone to disruption
+- attackers can more easily grief the system by timing withdrawals
+
+**Recommendation**
+Scope the frequency-based circuit breaker **per-user**, not globally.
+
+Replace:
+
+```solidity
+uint256 lastWithdrawalTimestamp;
+```
+
+with:
+
+```solidity
+mapping(address => uint256) lastUserWithdrawalTimestamp;
+```
+
+Then enforce:
+
+```solidity
+require(
+    block.timestamp - lastUserWithdrawalTimestamp[msg.sender] >= timeBetweenWithdrawalsThreshold,
+    "User withdrawals too frequent"
+);
+
+lastUserWithdrawalTimestamp[msg.sender] = block.timestamp;
+```
+
+# **Title**
+
+Withdrawal Window Logic Breaks for Short Months (e.g., February), Reducing Withdrawal Period to a Single Day
+
+**Severity**
+Medium
+
+**Description**
+The protocol restricts withdrawals to a monthly window defined as the 28th–30th day of each month:
+
+```solidity
+function canWithdraw() public view returns (bool) {
+    (, , uint256 day) = _timestampToDate(block.timestamp);
+
+    // Allow withdrawals from 28th to 30th of each month
+    return (day >= 28 && day <= 30);
+}
+```
+
+This logic assumes that every month contains at least 30 days.
+
+However, months such as **February only have 28 or 29 days**.
+In those cases:
+
+- `day == 28` is the only day that satisfies `(28 ≤ day ≤ 30)`
+- The withdrawal window effectively collapses to **just one day**
+- In non-leap years, users can withdraw _only on February 28th_
+- In leap years, users can withdraw only on **February 28th–29th**
+
+This behavior is inconsistent across months and unintentionally restricts user withdrawal access.
+
+The window is advertised or implied to be 3 days per month, but in February it becomes:
+
+- 1 day (28-day month)
+- 2 days (29-day leap year)
+
+This creates a UX and availability issue where users may be locked out of withdrawals during that month.
+
+**Impact**
+Users may:
+
+- be unable to withdraw for the expected duration
+- miss the restricted window due to timezone or operational constraints
+- experience inconsistent and unpredictable withdrawal rules
+
+**Recommendation**
+Redesign the withdrawal window logic to be **calendar-aware and duration-based**, not tied to specific day numbers.
+
+**Use “last 3 days of month” instead of 28–30**
+
+Compute days remaining in the month and allow withdrawals when:
+
+```solidity
+day >= (daysInMonth - 2);
+```
+
+This ensures:
+
+- February still has a 3-day withdrawal window
+- behavior is consistent across all months
+
+* If current behavior is intentional, it should be explicitly disclosed; however, this is still user-hostile and operationally fragile.
+
+# **Title**
+
+`deployWithRecommendedMultiSig()` Does Not Prevent Duplicate Signers
+
+**Severity**Medium
+
+**Description**
+The `deployWithRecommendedMultiSig()` function accepts an array of 5 signer addresses for a multi-signature setup:
+
+```solidity
+address[5] memory signers
+```
+
+Currently, the function validates only that:
+
+```solidity
+if (signers[i] == address(0)) revert();
+```
+
+**It does not check that the signer addresses are unique.**
+
+Consequences:
+
+- The same address can appear multiple times in the signer list.
+- This reduces the effective decentralization of the multi-sig.
+- The intended minimum number of signers (`minDelay` and quorum assumptions) may be trivially bypassed by reusing addresses.
+- A malicious or careless deployer could accidentally weaken the security of the governance/upgrade control.
+
+Example:
+
+- If 3 of 5 signers are duplicates of the same address:
+
+  - That address effectively controls a majority of proposers and executors
+  - Security guarantees of a 5-of-5 multi-sig are effectively reduced to 1-of-5
+
+This undermines the **core trust assumptions** of the multi-signature contract.
+
+**Impact**
+
+- Multi-sig governance could be compromised by duplicate addresses.
+- Upgrades or transactions could be authorized by fewer independent parties than intended.
+
+**Recommendation**
+
+Add a uniqueness check for the signer array before deployment. For example:
+
+```solidity
+for (uint256 i = 0; i < signers.length; i++) {
+    for (uint256 j = i + 1; j < signers.length; j++) {
+        require(signers[i] != signers[j], "Duplicate signer detected");
+    }
+}
+```
+
+# **Title**
+
+Hardcoded Aave Provider Address in Deployment Function
+
+**Severity**
+Low
+
+**Description**
+The `_deployAaveIntegration()` function deploys a new `AaveIntegration` proxy and uses a **hardcoded Aave provider address** as the default:
+
+```solidity
+address provider = aaveProvider == address(0)
+    ? 0x9F7Cf9417D5251C59fE94fB9147feEe1aAd9Cea5  // Default Celo Aave V3 provider
+    : aaveProvider;
+```
+
+- Hardcoding addresses is **unadvisable** because:
+
+  - Network deployments may differ (testnet/mainnet/fork)
+  - The provider contract may upgrade, move, or change
+  - It increases the risk of misconfiguration and potential loss of funds/Dos
+
+**Impact**
+Using a hardcoded provider can lead to:
+
+- failed integrations
+- unexpected behavior due to incorrect provider contract
+- reduced flexibility in deployment and upgrades
+
+**Recommendation**
+
+**Remove hardcoded addresses**.
+
+# **Title**
+
+`MiniSafeTokenStorageUpgradeable` Pause/Unpause Mechanism Has No Effect
+
+**Severity**
+Low
+
+**Description**
+The `MiniSafeTokenStorageUpgradeable` contract inherits `PausableUpgradeable` and exposes:
+
+```solidity
+function pause() external onlyOwner { _pause(); }
+function unpause() external onlyOwner { _unpause(); }
+```
+
+However, **none of the contract’s external or state-changing functions use the `whenNotPaused` modifier** or perform an internal `_paused()` check.
+
+Consequently:
+
+- Calling `pause()` or `unpause()` changes the paused state internally, but **does not prevent any function from being executed**.
+- The pause/unpause mechanism is therefore **effectively non-functional**.
+- This defeats the intended purpose of the pause functionality, which is typically used to **halt critical operations during emergency or upgrade scenarios**.
+
+**Impact**
+
+- Owners cannot halt contract operations in emergencies.
+
+**Recommendation**
+Apply `whenNotPaused` to **all critical state-changing functions** or remove the inheritamce of pausableupgradeable if its not needed.
+
+# **Title**
+
+Thrift Group Cannot Be Activated on Start Date Due to Strict Time Check
+
+**Severity**
+Low
+
+**Description**
+A thrift group is activated manually via:
+
+```solidity
+function activateThriftGroup(uint256 groupId) external onlyGroupAdmin(groupId) {
+```
+
+Activation is currently restricted to only before the start date:
+
+```solidity
+require(block.timestamp < group.startDate, "Group has already started");
+```
+
+This introduces an edge-case constraint:
+
+- If the admin does **not** activate the group before `startDate`,
+- Then once `startDate` is reached,
+- Activation becomes **permanently impossible**.
+
+Meaning the group:
+
+- cannot be started
+- cannot be used
+- becomes permanently stuck in an inactive state
+
+Even if:
+
+- all members are present
+- payout order is valid
+- funds are ready
+
+This is unintuitive and breaks expected flow, activation should logically still be allowed on the start date. One second of lateness bricks the group forever.
+
+**Impact**
+Usability & operational impact:
+
+- Groups can become stuck and unusable even though configuration is valid
+- Users cannot participate in intended thrift cycle
+- Admin must recreate the entire group
+- Prior configuration & member state must be redone
+
+**Recommendation**
+Allow activation **on or before** the start date instead of strictly before it.
+
+Replace:
+
+```solidity
+require(block.timestamp < group.startDate, "Group has already started");
+```
+
+With:
+
+```solidity
+require(block.timestamp <= group.startDate, "Group has already started");
+```
+
+
+
+Report of Findings
+High Severity Issues
+[H-1] Emergency Withdrawal Fails to Transfer Recovered Tokens.
+Description: The executeEmergencyWithdrawal function in MiniSafeAaveUpgradeable.sol is designed to allow the contract owner to recover all funds from Aave in emergency situations. However, the function withdraws tokens from Aave to the contract itself (address(this)) but never transfers these tokens to the owner or distributes them to users. The withdrawn tokens become permanently trapped in the contract with no mechanism to retrieve them.
+
+
+The function performs the withdrawal from Aave correctly but is missing the final step of transferring the recovered tokens. After withdrawFromAave completes:
+
+Tokens are sitting in the MiniSafeAaveUpgradeable contract
+No transfer or safeTransfer call is made
+No mechanism exists elsewhere in the contract to retrieve these tokens
+The amountWithdrawn return value is captured but never used
+
+
+Impact
+Any tokens recovered through emergency withdrawal are permanently locked in the contract.
+The entire purpose of the emergency withdrawal mechanism is defeated
+All user deposits that are emergency-withdrawn become inaccessible to both users and the protocol.
+Recommendation
+Transfer withdrawn tokens directly to the owner
+
+[H-2] No Mechanism to Claim Aave External Reward Incentives Description: Aave V3 implements an incentives system through the RewardsController contract that distributes additional token rewards to users who supply or borrow assets. These rewards are separate from the interest yield (aToken rebasing) and include tokens such as:
+stkAAVE (Staked AAVE) - Primary Aave incentive token
+OP tokens on Optimism
+ARB tokens on Arbitrum
+MATIC on Polygon
+Various partner tokens through co-incentive programs
+When MiniSafe deposits user funds to Aave, these incentive rewards accrue to the MiniSafeAaveIntegrationUpgradeable contract address. However, the protocol has no function to claim these rewards, resulting in permanent loss of all accumulated incentives.This is distinct from the yield/interest issue because: Incentive rewards must be actively claimed via RewardsController.claimRewards()
+Without a claim function, rewards accumulate but are never collected
+
+Impact
+Complete Loss of Incentive Rewards
+Recommendation
+Add Rewards Claiming
+
+[H-3] Depositors Receive Zero Interest
+Description: The MiniSafe protocol integrates with Aave V3 to generate yield on user deposits. However, due to a fundamental flaw in the share-based accounting system, users receive zero interest on their deposits. The protocol records shares equal to the exact deposit amount (1:1 ratio) and never updates this ratio as interest accrues. When users withdraw, they can only withdraw their original deposit amount, while all accumulated interest remains permanently trapped in the protocol with no mechanism for distribution.This completely defeats the core value proposition of the protocol - earning yield on savings through Aave integration.
+
+Impact
+Depositors get zero interest
+Recommendation
+Add Exchange Rate Tracking to TokenStorage, or depositors should receive aToken after deposits
+
+[H-4] Incorrect Refund Calculation Due to totalContributed Not Being Reset at Cycle End
+Description: In the MiniSafe thrift group functionality, when a cycle completes and payouts are processed, the _resetCycle function resets the contributions mapping (current cycle contributions) and hasPaidThisCycle flag, but fails to reset the totalContributed mapping. This creates a critical accounting discrepancy because totalContributed accumulates across all cycles, while the actual tokens from previous cycles have already been distributed as payouts.When a user leaves a group via the leaveGroup function, the contract attempts to refund group.totalContributed[msg.sender], which includes contributions from all previous cycles—tokens that no longer exist in the contract because they were already paid out to recipients.This creates two severe issues:
+
+Excessive Refunds: Users who leave after multiple cycles could claim refunds far exceeding the actual tokens available
+Fund Drain: The refund mechanism could drain tokens belonging to other users or from other groups
+
+Impact
+All Funds in the contract can be drained or wrongly refunded
+Recommendation
+Reset totalContributed in _resetCycle
+
+Medium Level Severity Issues
+[M-1] Excess Contribution Amounts Are Permanently Trapped in Contract
+Description: In the MiniSafe thrift group functionality, when users make contributions via the makeContribution function, they can send any amount greater than or equal to the required contributionAmount. The function only validates that the amount meets the minimum requirement but does not enforce an exact match or refund excess amounts. Any tokens sent above the required contribution amount are permanently trapped in the contract with no mechanism for retrieval.The function transfers the full user-specified amount from the user's wallet but only tracks the standard contributionAmount in the group's accounting. When payouts are processed, they are calculated based on contributionAmount × memberCount, meaning the excess tokens are never distributed and remain stuck in the contract forever.
+Impact
+Excess contributions are permanently locked
+Recommendation
+Enforce Exact Contribution Amount.
+
+[M-2] Emergency Withdrawal Timelock Defeats Purpose of Emergency Response Mechanism
+Description: The executeEmergencyWithdrawal function in MiniSafeAaveUpgradeable implements a 2-day timelock before emergency withdrawals can be executed. While timelocks are generally good security practice for administrative functions, applying a timelock to an emergency function fundamentally contradicts its purpose. In genuine emergency situations—such as protocol exploits, critical vulnerabilities, or external DeFi protocol failures—a 2-day delay renders the emergency mechanism completely ineffective.By the time the timelock expires, the emergency that necessitated the withdrawal may have already resulted in complete loss of funds. This design flaw transforms what should be a rapid response mechanism into a slow administrative process, leaving user funds vulnerable during the most critical moments.
+Impact
+Emergency Scenarios Where 2-Day Delay Is Fatal
+Recommendation
+Remove Timelock
+
+[M-3] Thrift Group Contributions Held in Contract Instead of Earning Yield in Aave 
+Description: The MiniSafe protocol integrates with Aave V3 to generate yield on user deposits through the personal savings functionality. However, when users make contributions to thrift groups via the makeContribution function, these funds are transferred directly to the MiniSafeAaveUpgradeable contract and held there idle instead of being deposited to Aave to earn yield.This creates an architectural inconsistency where:
+
+Personal savings deposits → Sent to Aave → Earn yield
+Thrift group contributions → Held in contract → Earn 0% yield
+Given that thrift groups operate on 30-day cycles and funds may sit in the contract for extended periods before payout, this represents a significant missed yield opportunity and contradicts the protocol's core value proposition of earning yield through Aave integration.
+
+Impact
+Contributions do not earn yields
+Recommendation
+Deposit Contributions to Aave 
+
+[M-4] Factory Contract Fails to Track Deployed Proxies - isMiniSafeContract Returns False for All Deployed Contracts
+Description: The MiniSafeFactoryUpgradeable contract contains a critical logic flaw in its isMiniSafeContract function. This function is designed to verify whether a given address is a legitimate MiniSafe contract deployed by the factory. However, it incorrectly checks if the address matches the implementation contract addresses rather than the deployed proxy addresses. When the factory deploys the MiniSafe system, it creates ERC1967 proxy contracts that point to the implementations. Users and administrators interact with these proxy addresses, not the implementations. However:
+The factory never stores the deployed proxy addresses
+isMiniSafeContract only checks against implementation addresses
+All deployed proxies return false when verified
+Functions relying on this check (upgradeSpecificContract, batchUpgradeContracts) are completely broken
+This means the factory's upgrade functionality is non-operational, and any external systems relying on this verification will incorrectly reject legitimate MiniSafe contracts.
+
+Impact
+isMiniSafeContract always returns false
+upgradeSpecificContract always reverts
+getContractImplementation always returns zero address
+Recommendation
+Add Proxy Tracking
+
+[M-5] cUSD Token Initialization Failure - Missing aToken Configuration and Broken Share Tracking
+Description: The MiniSafeTokenStorageUpgradeable contract is designed to manage supported tokens and their corresponding Aave aToken addresses. The contract hardcodes the cUSD (Celo Dollar) address and sets it as the default supported token during initialization. However, there are two critical flaws:
+
+Missing aToken Configuration: While cusdTokenAddress is set, the tokenInfo[cusdTokenAddress] struct is never initialized with the corresponding aToken address. This means getTokenATokenAddress(cusdTokenAddress) returns address(0).
+Broken Share Tracking: The totalShares for cUSD is never properly initialized in the tokenInfo mapping, causing all share-related operations to fail or produce incorrect results.
+
+These issues mean that cUSD—the primary stablecoin on Celo and the default token for the protocol—is completely non-functional. Any attempt to deposit, withdraw, or track balances for cUSD will fail or produce incorrect results.
+
+Recommendation
+Fix Initialize Function
+
+[M-6] nextPayoutDate Not Enforced - Payouts Can Be Processed Immediately Without Waiting for Scheduled Date
+Description: In the MiniSafe thrift group functionality, each group has a nextPayoutDate field that is intended to enforce a minimum waiting period between contribution collection and payout distribution. This date is set when the group is created and updated after each cycle. However, the _checkAndProcessPayout and _processPayout functions completely ignore this field, allowing payouts to be processed immediately once all members have contributed, regardless of the scheduled payout date.
+This violates the expected behavior, members contribute throughout a cycle period. At the end of the cycle (on nextPayoutDate), funds are distributed
+The next cycle begins with a new contribution period
+Instead, the current implementation processes payouts instantly when the last member contributes, potentially within minutes of the cycle starting.
+
+Impact
+Payouts occur immediately, not on scheduled date 
+
+Recommendation
+Add Time Check in _checkAndProcessPayout
+
+
+
+
+
+
+
+
+
+
+[L-1] updatePoolDataProvider and updateAavePool Emit Identical Event - Impossible to Distinguish Configuration Changes
+Description: In the MiniSafeAaveIntegrationUpgradeable contract, two distinct administrative functions—updatePoolDataProvider and updateAavePool—emit the same AavePoolUpdated event. This makes it impossible for off-chain systems, block explorers, indexers, and monitoring tools to distinguish between updates to the Pool Data Provider versus the Aave Pool contract.Both contracts serve fundamentally different purposes in the Aave V3 architecture:
+
+IPool: Handles state-changing operations (supply, withdraw, borrow, repay)
+IPoolDataProvider: Handles view-only queries (getReserveTokensAddresses, getUserReserveData)
+When an administrator updates either contract, the emitted event is identical, creating ambiguity in audit trails, monitoring systems, and incident response procedures.
+Impact
+Cannot determine which contract was updated
+Recommendation
+Add Separate Event for PoolDataProvider
+
+[L-2] Deposit Timestamp Is Overwritten and Never Used
+Description: Each new deposit overwrites the existing deposit timestamp, and the stored deposit time is never referenced or enforced anywhere in the protocol logic.
+This results in a state variable that:
+Does not represent the original deposit time
+Is not used for validation, accounting, lockups, cooldowns, or rewards
+Can be arbitrarily refreshed by making a new deposit
+
+Impact
+Incorrect State Representation
+Recommendation
+Enforce Deposit Time Properly
+
+
+
+
+
+
+
+

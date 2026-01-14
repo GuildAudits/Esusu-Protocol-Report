@@ -1154,8 +1154,6 @@ contract MockERC20 is IMockERC20 {
     function transferFrom(address from, address to, uint256 amount) external override returns (bool) { allowance[from][msg.sender] -= amount; balanceOf[from] -= amount; balanceOf[to] += amount; return true; }
 }
 
-// **FIX**: Moved contract definition to the top level
-// Test contract that inherits from the main contract to override the withdrawal check
 contract TestMiniSafe is MiniSafeAaveUpgradeable {
     function canWithdraw() public view override returns (bool) { return true; }
 }
@@ -1276,11 +1274,11 @@ contract FrontrunTest is Test {
   To fix this vulnerability, the protocol must avoid using a spot price to calculate shares to burn on exit. The number of shares burned for a refund must be equal to the number of shares
   that were minted for the corresponding contribution.
 
-   1. Store Minted Shares: When a user contributes to a group in the makeContribution function, the number of shares minted to the thrift pool (sharesToMint) is calculated. This value
+  1. When a user contributes to a group in the makeContribution function, the number of shares minted to the thrift pool (sharesToMint) is calculated. This value
       should be stored in the ThriftGroup struct, linked to the user's contribution for that cycle.
-       * Example: group.cycleContributionShares[msg.sender] = sharesToMint;
-   2. Burn Stored Shares: In the leaveGroup function, replace the vulnerable calculation with a direct retrieval of the stored share amount.
-       * Example: uint256 sharesToBurn = group.cycleContributionShares[msg.sender];
+       Example: group.cycleContributionShares[msg.sender] = sharesToMint;
+   2.  In the leaveGroup function, replace the vulnerable calculation with a direct retrieval of the stored share amount.
+       Example: uint256 sharesToBurn = group.cycleContributionShares[msg.sender];
 
   By linking the shares burned directly to the shares minted, the calculation becomes independent of the asset-to-share ratio at the time of withdrawal, completely neutralizing the
   front-running attack vector.

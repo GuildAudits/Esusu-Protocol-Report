@@ -1269,6 +1269,36 @@ contract FrontrunTest is Test {
 }
 
   ```
+##### Logs
+```sh
+                                                                                                                                         │
+│ Ran 1 test for test/PoC_Frontrun.t.sol:FrontrunTest                                                                                      │
+│ [PASS] test_PoC_Frontrun_LeaveGroup() (gas: 688868)                                                                                      │
+│ Logs:                                                                                                                                    │
+│   --- PRE-ATTACK STATE ---                                                                                                               │
+│   Alice USDC Balance:  999900000000000000000000                                                                                          │
+│   Pool Share Balance:  100000000000000000000                                                                                             │
+│   Expected Shares to Burn on Exit:  100000000000000000000                                                                                │
+│                                                                                                                                          │
+│ --- ATTACK BEGINS (targeting leaveGroup) ---                                                                                             │
+│   Step A (Front-run): Inflated Total Assets to -> 100000000000000000000000000                                                            │
+│   Step B (Victim's Tx): Alice calls leaveGroup...                                                                                        │
+│   Step C (Back-run): Restored Total Assets                                                                                               │
+│                                                                                                                                          │
+│ --- ATTACK COMPLETE ---                                                                                                                  │
+│                                                                                                                                          │
+│ --- POST-ATTACK STATE ---                                                                                                                │
+│   Alice USDC Balance:    1000000000000000000000000                                                                                       │
+│   Pool Share Balance:   98999900000000000000                                                                                             │
+│   Actual Pool Shares Burned:    1000100000000000000                                                                                      │
+│                                                                                                                                          │
+│ SUCCESS: Alice was refunded 100 USDC. The protocol should have burned ~100 shares, but only burned a negligible amount due to the        │
+│ exploit.                                                                                                                                 │
+│                                                                                                                                          │
+│ Suite result: ok. 1 passed; 0 failed; 0 skipped; finished in 7.04ms (1.44ms CPU time)                                                    │
+│                                                                                                                                          │
+│ Ran 1 test suite in 30.88ms (7.04ms CPU time): 1 tests passed, 0 failed, 0 skipped (1 total tests)   
+```
 
 ### Recommended Mitigation
 

